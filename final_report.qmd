@@ -1,0 +1,230 @@
+---
+title: "English Premier League PCA Analysis"
+format: html
+editor: visual
+---
+
+For the first part of this project, we will be analyzing soccer player data for the English Premier League for the 2024-2025 season. This dataset, which was obtained from the SCORE sports data repository, contains 57 variables with 562 observations where each row is a player in the EPL. Included in the data is basic information about the players, such as team, nationality, and position, along with the performance metrics of the players. Also, fouls, yellow/red cards, and errors are reported. There is information about player's offensive and defensive output, and there are a number of metrics pertaining to goalkeeper performance, like saves/save percentage and goals conceded/prevented. Overall, the dataset provides a comprehensive view of player statistics across all areas of play. Therefore, with these variables we can explore how they relate to player scoring. The research question for this project is **how well do principal components derived from EPL player performance statistics predict total goals scored?**
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+
+soccer_data = read_csv("~/Downloads/epl_player_stats_24_25.csv")
+```
+
+One thing to note is that this dataset contains some columns that are reported with the percentage symbol. Therefore, some preprocessing and cleaning must be done to make these variables numeric and ready for use. Also, for this analysis, the "Player Name", "Club", and "Nationality" columns will be removed from the dataset since they will not be used as predictors of total goals.
+
+```{r}
+soccer_data = soccer_data |>
+  mutate(across(contains("%"),
+                ~ as.numeric(str_replace(., "%", "")))) |>
+  select(-`Player Name`, -Club, -Nationality)
+
+
+set.seed(123)
+
+split = initial_split(soccer_data, prop = 0.8)
+train = training(split)
+test = testing(split)
+```
+
+### Exploratory Data Analysis
+
+Before modeling, we will do an exploratory data analysis to understand the structure and distribution of the data, specifically focused on goals scored.
+
+#### Structure and Summary
+
+```{r}
+soccer_data$Goals |> summary()
+```
+
+The distribution of total goals scored is extremely right‑skewed. The median number of goals is 0, and 75% of players scored two or fewer goals during the season. Only a small group of forwards scored at the high end of the distribution, with a maximum of 29 goals. This imbalance reflects the structure of soccer positions, where most players, such as defenders and midfielders, rarely score. The skewed distribution also suggests that predicting goals is inherently challenging, since the majority of players contribute little or no scoring output, while a small number account for most of the variation.
+
+#### Distribution of Goals
+
+```{r}
+soccer_data |> 
+  ggplot(aes(x = Goals)) +
+  geom_histogram(bins = 20, fill = "steelblue") +
+  labs(title = "Distribution of Goals Scored",
+       x = "Goals", y = "Count")
+```
+
+The histogram shows a heavily right‑skewed distribution, with many players scoring zero goals. This indicates that goal scoring is rare for most positions, which limits how much variance any model can explain.
+
+#### Relationship Between Shots and Goals
+
+```{r}
+soccer_data |> 
+  ggplot(aes(x = Shots, y = Goals)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Relationship Between Shots and Goals")
+```
+
+As expected, players who take more shots tend to score more goals, but the relationship is noisy. This again suggests that goal scoring depends on multiple interacting factors.
+
+Overall, the EDA suggests that goal scoring is influenced by many correlated performance metrics, supporting the use of PCA to reduce dimensionality before fitting predictive models.
+
+### Dimensionality Reduction (PCA)
+
+Since this dataset contains 57 different predictors, we will start by performing a Principal Component Analysis on the data to get a smaller set of predictor variables to ensure that there is little redundancy and correlation among our variables. Also, using PCA will prove to be beneficial since it will make out machine learning and regression methods more efficient in training and reducing sensitivity to the noise of the data.
+
+```{r}
+pca_rec = recipe(Goals ~., data = train) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), threshold = 0.95)
+```
+
+### Models
+
+For this analysis, to find how well the principal components are at predicting goal scoring, three different models will be employed and then compared to determine which is best at predicting. The models that will be used will be a multiple regression model, a random forest regressor, and an SVM regressor.
+
+#### Multiple Regression Model
+
+The first model that will be built is with multiple regression. A workflow will be set up using the PCA recipe and the multiple regression model. Then, the hyperparameters will be tuned to find the best parameters for the model to create the final fit that will then provide us with the metrics to use in later comparison. Also, we will apply the fit to the testing data for model validation to learn if there is any over or underfitting.
+
+```{r}
+reg_model = linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+reg_wf = workflow() |>
+  add_recipe(pca_rec) |>
+  add_model(reg_model)
+
+cv_folds = vfold_cv(train, v = 3)
+
+en_grid = grid_regular(
+  penalty(),
+  mixture(),
+  levels = 3
+)
+
+en_tune = tune_grid( 
+  reg_wf,
+  resamples = cv_folds,
+  grid = en_grid,
+  metrics = metric_set(rmse, rsq)
+)
+
+best_params = select_best(en_tune, metric = "rsq")
+
+reg_model_final = finalize_workflow(reg_wf, best_params)
+    
+reg_fit = fit(reg_model_final, data = train)
+
+train_preds = predict(reg_fit, new_data = train) |> 
+  bind_cols(train)
+
+test_preds = predict(reg_fit, new_data = test) |> 
+  bind_cols(test)
+
+rsq(train_preds, truth = Goals, estimate = .pred)
+
+rsq(test_preds, truth = Goals, estimate = .pred)
+```
+
+Here, we can see that the R-squared for the training data was 0.636 and the R-squared for the testing data was 0.604. Therefore, it can be concluded that there was some overfitting present since the training set has a higher R-squared value; however, it is not of great concern since the values are somewhat similar.
+
+#### Random Forest Regressor
+
+The next model that will be applied is a random forest regressor. Similar to the multiple regression model, we will create a model and add both the model and PCA recipe to a workflow. Then, we will tune out hyperparameters to discover the best ones for the model' fit and apply that to both the training and testing data.
+
+```{r}
+rf_model = rand_forest(
+  trees = 100,
+  mtry = tune(),
+  min_n = tune()) |>
+  set_engine("ranger") |>
+  set_mode("regression")
+
+rf_wf = workflow() |>
+  add_recipe(pca_rec) |>
+  add_model(rf_model)
+
+tuning_grid = grid_regular(
+  mtry(range = c(5, 20)),
+  min_n(range = c(5, 20)),
+  levels = 3
+)
+
+rf_results = tune_grid(
+  rf_wf,
+  resamples = cv_folds,
+  gird = tuning_grid,
+  metrics = metric_set(rmse, rsq))
+
+best_params = select_best(rf_results, metric = "rsq")
+
+rf_final = finalize_workflow(rf_wf, best_params)
+
+rf_fit = fit(rf_final, data = train)
+
+train_preds = predict(rf_fit, new_data = train) |>
+  bind_cols(train)
+
+test_preds = predict(rf_fit, new_data = test) |>
+  bind_cols(test)
+
+rsq(train_preds, truth = Goals, estimate = .pred)
+
+rsq(test_preds, truth = Goals, estimate = .pred)
+```
+
+For the random forest regressor, the training data has an R-squared of 0.926 and the testing only has an R-sauared of 0.586. This means that there is severe overfitting present and the model learned too much of the noise of the training data set and did not perform well with unseen data.
+
+#### SVM Regressor
+
+For the final model, we will be building an SVM regressor. Like above for the first two models, we will make a workflow with the model and recipe and then use tuning to find the ideal parameters. After that, we will compare how the model did for the training and testing data with model validation.
+
+```{r}
+svm_model = svm_rbf(cost = tune(), rbf_sigma = tune()) |>
+  set_engine("kernlab") |>
+  set_mode("regression")
+
+svm_wf = workflow() |>
+  add_recipe(pca_rec) |>
+  add_model(svm_model)
+
+grid = grid_regular(
+  cost(range = c(-3,1)),
+  rbf_sigma(range = c(-3,1)),
+  levels = 3
+)
+
+svm_results = tune_grid(
+  svm_wf,
+  resamples = cv_folds,
+  grid = grid
+)
+
+best_params = select_best(svm_results, metric = "rsq")
+
+svm_final = finalize_workflow(svm_wf, best_params)
+
+svm_fit = fit(svm_final, data = train)
+
+train_preds = predict(svm_fit, new_data = train) |>
+  bind_cols(train)
+
+test_preds = predict(svm_fit, new_data = test) |>
+  bind_cols(test)
+
+rsq(train_preds, truth = Goals, estimate = .pred)
+
+rsq(test_preds, truth = Goals, estimate = .pred)
+```
+
+For the SVM regressor model, the training dataset has an R-squared of 0.607 and the testing set has an R-squared value of 0.636. Here, there is slight underfitting present since the R-squared of the training is slightly lower than the testing R-squared value.
+
+### Model Comparison
+
+After completing model validation on each of the models, it can be concluded that the best model for predicting goal scoring for the EPL is the random forest regressor. However, even though this model has the highest R-squared for the testing data, this model also showed the most severe overfitting and that the model learned specific trends of the training data instead of generalizing.
+
+### Conclusion
+
+Overall, since all of the testing R-squared values fell in between 0.59 and 0.64, it can be said that the principal components explain roughly 59%-64% of the variation among total goals scored for players in the English Premier League. Therefore, the principal components derived from EPL performance statistics provide a moderate ability to predict total goals scored since the best model for the testing sets, the SVM regressor, can explain about 64% of the variation. Therefore, even though PCA aided in reducing dimensions and modeling broad trends, it is not the best for fully capturing the data's complexity of goals scored.
